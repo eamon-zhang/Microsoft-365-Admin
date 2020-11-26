@@ -1,6 +1,10 @@
 package cn.itbat.microsoft.service.impl;
 
 
+import cn.binarywang.tools.generator.ChineseAddressGenerator;
+import cn.binarywang.tools.generator.ChineseMobileNumberGenerator;
+import cn.binarywang.tools.generator.ChineseNameGenerator;
+import cn.itbat.microsoft.cache.GraphCache;
 import cn.itbat.microsoft.config.GraphProperties;
 import cn.itbat.microsoft.enums.AccountStatusEnum;
 import cn.itbat.microsoft.enums.CapabilityStatusEnum;
@@ -8,17 +12,13 @@ import cn.itbat.microsoft.enums.RefreshTypeEnum;
 import cn.itbat.microsoft.model.GraphUser;
 import cn.itbat.microsoft.model.Pager;
 import cn.itbat.microsoft.service.GraphService;
+import cn.itbat.microsoft.service.MailService;
 import cn.itbat.microsoft.service.Microsoft365Service;
-import cn.itbat.microsoft.utils.HttpClientUtils;
 import cn.itbat.microsoft.utils.PageInfo;
 import cn.itbat.microsoft.utils.PasswordGenerator;
 import cn.itbat.microsoft.vo.*;
-import com.alibaba.fastjson.JSON;
 import com.alibaba.fastjson.JSONObject;
 import com.github.promeg.pinyinhelper.Pinyin;
-import com.google.common.cache.CacheBuilder;
-import com.google.common.cache.CacheLoader;
-import com.google.common.cache.LoadingCache;
 import com.google.gson.Gson;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
@@ -27,7 +27,6 @@ import com.microsoft.graph.models.extensions.Domain;
 import com.microsoft.graph.models.extensions.SubscribedSku;
 import com.microsoft.graph.models.extensions.User;
 import lombok.extern.slf4j.Slf4j;
-import org.checkerframework.checker.nullness.qual.NonNull;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 import org.springframework.util.CollectionUtils;
@@ -36,8 +35,6 @@ import org.springframework.util.StringUtils;
 import javax.annotation.Resource;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.TreeSet;
-import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 /**
@@ -56,60 +53,39 @@ public class Microsoft365ServiceImpl implements Microsoft365Service {
     private GraphService graphService;
 
     @Resource
+    private MailService mailService;
+
+    @Resource
     private GraphProperties graphProperties;
 
-    private LoadingCache<String, List<User>> usersCache = CacheBuilder.newBuilder()
-            .expireAfterWrite(1, TimeUnit.DAYS)
-            .build(new CacheLoader<String, List<User>>() {
-                @Override
-                public List<User> load(@NonNull String key) {
-                    return graphService.getUsers(key);
-                }
-            });
+    @Resource
+    private GraphCache graphCache;
 
-    private LoadingCache<String, List<SubscribedSku>> licenseCache = CacheBuilder.newBuilder()
-            .expireAfterWrite(30, TimeUnit.DAYS)
-            .build(new CacheLoader<String, List<SubscribedSku>>() {
-                @Override
-                public List<SubscribedSku> load(@NonNull String key) {
-                    return graphService.getSubscribedSkus(key);
-                }
-            });
 
-    private LoadingCache<String, List<Domain>> domainCache = CacheBuilder.newBuilder()
-            .expireAfterWrite(1, TimeUnit.DAYS)
-            .build(new CacheLoader<String, List<Domain>>() {
-                @Override
-                public List<Domain> load(@NonNull String key) {
-                    return graphService.getDomains(key);
-                }
-            });
-
-    @Async("asyncPoolTaskExecutor")
     @Override
     public void refresh(String appName, Integer type) {
         if (type == null) {
-            usersCache.refresh(appName);
-            licenseCache.refresh(appName);
-            domainCache.refresh(appName);
+            graphCache.refreshUsers(appName);
+            graphCache.refreshLicense(appName);
+            graphCache.refreshDomain(appName);
             log.info("【Microsoft 365】全部刷新成功");
             return;
         }
         if (RefreshTypeEnum.USER.getType().equals(type)) {
-            usersCache.refresh(appName);
+            graphCache.refreshUsers(appName);
         }
         if (RefreshTypeEnum.SUB.getType().equals(type)) {
-            licenseCache.refresh(appName);
+            graphCache.refreshLicense(appName);
         }
         if (RefreshTypeEnum.DOMAIN.getType().equals(type)) {
-            domainCache.refresh(appName);
+            graphCache.refreshDomain(appName);
         }
         log.info("【Microsoft 365】{} 刷新成功", RefreshTypeEnum.getName(type));
     }
 
     @Override
     public List<SubscribedSkuVo> getSubscribed(String appName) {
-        List<SubscribedSku> subscribedSkus = licenseCache.getUnchecked(appName);
+        List<SubscribedSku> subscribedSkus = graphCache.getLicenseCache(appName);
         if (CollectionUtils.isEmpty(subscribedSkus)) {
             return null;
         }
@@ -139,7 +115,7 @@ public class Microsoft365ServiceImpl implements Microsoft365Service {
 
     @Override
     public List<DomainVo> getDomainVo(String appName) {
-        List<Domain> domains = domainCache.getUnchecked(appName);
+        List<Domain> domains = graphCache.getDomainCache(appName);
         if (CollectionUtils.isEmpty(domains)) {
             return null;
         }
@@ -166,7 +142,7 @@ public class Microsoft365ServiceImpl implements Microsoft365Service {
 
     @Override
     public PageInfo<GraphUserVo> getGraphUserVos(String appName, Pager pager) {
-        List<User> users = usersCache.getUnchecked(appName);
+        List<User> users = graphCache.getUsersCache(appName);
         if (CollectionUtils.isEmpty(users)) {
             return new PageInfo<>();
         }
@@ -176,9 +152,9 @@ public class Microsoft365ServiceImpl implements Microsoft365Service {
     @Override
     public PageInfo<GraphUserVo> getGraphUserVos(GraphUserVo graphUserVo, Pager pager) {
         // 判断是否有条件
-        List<User> users = new ArrayList<>();
+        List<User> users;
         if (StringUtils.isEmpty(graphUserVo.getDisplayName()) && StringUtils.isEmpty(graphUserVo.getUserPrincipalName())) {
-            users = usersCache.getUnchecked(graphUserVo.getAppName());
+            users = graphCache.getUsersCache(graphUserVo.getAppName());
         } else {
             users = graphService.getUsers(graphUserVo);
         }
@@ -226,7 +202,7 @@ public class Microsoft365ServiceImpl implements Microsoft365Service {
             for (AssignedLicense assignedLicense : assignedLicenses) {
                 String skuName = graphProperties.getSubConfigDisplayName(assignedLicense.skuId.toString());
                 if (StringUtils.isEmpty(skuName)) {
-                  skuName = "存在订阅";
+                    skuName = "存在订阅";
                 }
                 skuVos.add(SkuVo.builder()
                         .skuId(assignedLicense.skuId.toString())
@@ -241,7 +217,7 @@ public class Microsoft365ServiceImpl implements Microsoft365Service {
     @Override
     public GraphUserVo create(GraphUserVo graphUserVo) {
         if (StringUtils.isEmpty(graphUserVo.getDomain())) {
-            graphUserVo.setDomain(domainCache.getUnchecked(graphUserVo.getAppName()).stream().filter(l -> l.isDefault).collect(Collectors.toList()).get(0).id);
+            graphUserVo.setDomain(graphCache.getDomainCache(graphUserVo.getAppName()).stream().filter(l -> l.isDefault).collect(Collectors.toList()).get(0).id);
         }
         // 构建用户对象
         GraphUser graphUser = GraphUser.builder()
@@ -259,6 +235,9 @@ public class Microsoft365ServiceImpl implements Microsoft365Service {
         GraphUserVo graphUserVoResult = this.getGraphUserVo(user);
         graphUserVoResult.setPassword(graphUser.getPassword());
         // 发送邮件
+        if (!StringUtils.isEmpty(graphUserVo.getMailbox())) {
+            mailService.sendMail(graphUserVo.getMailbox(), graphUser.getUserPrincipalName(), graphUserVoResult.getPassword());
+        }
         // 清空原来的缓存
         return graphUserVoResult;
     }
@@ -333,49 +312,30 @@ public class Microsoft365ServiceImpl implements Microsoft365Service {
         }
     }
 
+
     @Async("asyncPoolTaskExecutor")
     @Override
-    public void createBatch(Integer num, String appName, String region, String skuId, String domain) {
-        //
-        String s = HttpClientUtils.sendGet("http://api.neton.ml/api", "amount=" + num + "&region=" + region + "&ext");
-        List<UserVo> userVoList = JSON.parseArray(s, UserVo.class);
-        if (CollectionUtils.isEmpty(userVoList)) {
-            return;
-        }
+    public void createBatch(Integer num, String appName, String skuId, String domain, String password) {
         if (StringUtils.isEmpty(domain)) {
-            domain = domainCache.getUnchecked(appName).stream().filter(l -> l.isDefault).collect(Collectors.toList()).get(0).id;
+            domain = graphCache.getDomainCache(appName).stream().filter(l -> l.isDefault).collect(Collectors.toList()).get(0).id;
         }
-        List<UserVo> unique = userVoList.stream().collect(Collectors.collectingAndThen(
-                Collectors.toCollection(
-                        () -> new TreeSet<>((o1, o2) -> {
-                            if (o1.getName().compareTo(o2.getName()) == 0) {
-                                return 0;
-                            } else {
-                                return o1.getName().compareTo(o2.getName());
-                            }
-                        }))
-                , ArrayList::new)
-        );
-
-        for (UserVo userVo : unique) {
+        for (int i = 0; i < num; i++) {
             try {
                 Thread.sleep(2000);
             } catch (InterruptedException e) {
                 e.printStackTrace();
             }
-            String mailNickname = userVo.getName().toLowerCase();
-            if (CHINA.equals(region)) {
-                mailNickname = Pinyin.toPinyin(userVo.getName() + userVo.getSurname(), "").toLowerCase();
-            }
+            String displayName = ChineseNameGenerator.getInstance().generate();
+            String mailNickname = Pinyin.toPinyin(displayName, "").toLowerCase();
             GraphUser graphUser = GraphUser.builder()
                     .country("中国")
-                    .surname(userVo.getSurname())
-                    .givenName(userVo.getName())
-                    .displayName(CHINA.equals(region) ? userVo.getName() + userVo.getSurname() : userVo.getSurname() + " " + userVo.getName())
+                    .city("LOC")
+                    .displayName(displayName)
                     .mailNickname(mailNickname)
-                    .mobilePhone(userVo.getPhone())
+                    .mobilePhone(ChineseMobileNumberGenerator.getInstance().generate())
+                    .streetAddress(ChineseAddressGenerator.getInstance().generate())
                     .userPrincipalName(mailNickname + "@" + domain)
-                    .password("P" + new PasswordGenerator(6, 3).generateRandomPassword() + "&")
+                    .password(StringUtils.isEmpty(password) ? "P" + new PasswordGenerator(6, 3).generateRandomPassword() + "&" : password)
                     .skuId(skuId).build();
             log.info("【Office】创建用户开始：" + JSONObject.toJSONString(graphUser));
             try {
@@ -415,17 +375,16 @@ public class Microsoft365ServiceImpl implements Microsoft365Service {
             statisticsVo.setLicenses(subscribedSkuVos.stream().map(SubscribedSkuVo::getEnabled).reduce(Integer::sum).orElse(null));
             statisticsVo.setAllocatedLicenses(subscribedSkuVos.stream().map(SubscribedSkuVo::getConsumedUnits).reduce(Integer::sum).orElse(null));
             statisticsVo.setAvailableLicenses(statisticsVo.getLicenses() - statisticsVo.getAllocatedLicenses());
-
         }
     }
 
     private void getUsersStatisticsVo(String appName, StatisticsVo statisticsVo) {
-        List<User> users = usersCache.getUnchecked(appName);
+        List<User> users = graphCache.getUsersCache(appName);
         if (!CollectionUtils.isEmpty(users)) {
             statisticsVo.setUsers(users.size());
-            statisticsVo.setAllowedUsers(users.stream().filter(l -> l.accountEnabled).collect(Collectors.toList()).size());
-            statisticsVo.setBiddenUsers(users.stream().filter(l -> !l.accountEnabled).collect(Collectors.toList()).size());
-            statisticsVo.setUnauthorizedUsers(users.stream().filter(l -> CollectionUtils.isEmpty(l.assignedLicenses)).collect(Collectors.toList()).size());
+            statisticsVo.setAllowedUsers((int) users.stream().filter(l -> l.accountEnabled).count());
+            statisticsVo.setBiddenUsers((int) users.stream().filter(l -> !l.accountEnabled).count());
+            statisticsVo.setUnauthorizedUsers((int) users.stream().filter(l -> CollectionUtils.isEmpty(l.assignedLicenses)).count());
         }
     }
 
